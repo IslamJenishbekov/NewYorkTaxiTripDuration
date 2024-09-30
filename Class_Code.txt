@@ -1,0 +1,111 @@
+import pandas as pd
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.linear_model import Ridge
+from geopy import distance
+import numpy as np
+import h3
+
+class TripDurationPredicter():
+  def __init__(self, model):
+    self.model = model
+
+  def _transform(self, X):
+    X = X.copy()
+    X.drop("dropoff_datetime", axis=1, inplace=True)
+    X.drop("id", axis=1, inplace=True)
+    X["pickup_datetime"] = pd.to_datetime(X["pickup_datetime"])
+    X["day_of_week"] = X.pickup_datetime.dt.dayofweek
+    X["month"] = X.pickup_datetime.dt.month
+    X["hour"] = X.pickup_datetime.dt.hour
+    X["day_of_year"] = X.pickup_datetime.dt.dayofyear
+    X["is_first_anomal_period"] = X.day_of_year.map(lambda x: 1 if x in [23, 24] else 0)
+    X["is_second_anomal_period"] = X.day_of_year.map(lambda x: 1 if x == 151 else 0)
+
+    X["is_jam"]  = X.hour.map(lambda x: self._is_jam_analyze(x))
+    X.drop(["day_of_year", "hour", "month"], axis=1, inplace=True)
+
+    X["haversine"] = X.apply(lambda x: distance.distance((x.pickup_latitude, x.pickup_longitude), (x.dropoff_latitude, x.dropoff_longitude)).km, axis=1)
+    X["log_haversine"] = np.log1p(X.haversine)
+    X.drop("haversine", axis=1, inplace=True)
+
+    X["zone_start"] = X.apply(lambda x: self._get_zone(x.pickup_latitude, x.pickup_longitude), axis=1)
+    X["zone_end"] = X.apply(lambda x: self._get_zone(x.dropoff_latitude, x.dropoff_longitude), axis=1)
+
+    X["combination"] = X["zone_start"] + " " + X["zone_end"]
+    oftenest = X["combination"].value_counts().head(10).index.tolist()
+    oftenest = [i for i in oftenest if "NotInBox" not in i]
+    X["is_combination"] = X["combination"].map(lambda x: 1 if x in oftenest else 0)
+    X.drop(["combination", "zone_start", "zone_end"], axis=1, inplace=True)
+
+    X.vendor_id = X.vendor_id.map({1: 0, 2: 1})
+    X.store_and_fwd_flag = X.store_and_fwd_flag.map({"N": 0, "Y": 1})
+    X.passenger_count = X.passenger_count.map(lambda x: self._passenger_count_clipper(x))
+
+    X["hex_start"] = X.apply(lambda x: h3.geo_to_h3(x.pickup_latitude, x.pickup_longitude, 10), axis=1)
+    X["hex_end"] = X.apply(lambda x: h3.geo_to_h3(x.dropoff_latitude, x.dropoff_longitude, 10), axis=1)
+    X["hex_dif"] = X.apply(lambda x: h3.h3_distance(x.hex_start, x.hex_end), axis=1)
+    X["log_hex_dif"] = np.log1p(X.hex_dif)
+    X.drop(["hex_dif", "hex_start", "hex_end"], axis=1, inplace=True)
+
+    X = pd.get_dummies(X, columns=["passenger_count"])
+    X.drop(["pickup_longitude", "pickup_latitude", "dropoff_longitude", "dropoff_latitude", "pickup_datetime"], axis=1, inplace=True)
+
+    return X
+
+  def fit(self, X, y):
+    X = X.copy()
+    y = y.copy()
+
+    X = X[(y > y.quantile(0.01))&(y < y.quantile(0.99))]
+    y = y[(y > y.quantile(0.01))&(y < y.quantile(0.99))]
+
+    y = y[(X.pickup_longitude > -75)&(X.pickup_longitude < -71)]
+    y = y[(X.pickup_latitude < 41.5)&(X.pickup_latitude > 40.2)]
+    y = y[(X.dropoff_longitude > -75)&(X.dropoff_longitude < -71)]
+    y = y[(X.dropoff_latitude < 41.5)&(X.dropoff_latitude > 40.2)]
+    X = X[(X.pickup_longitude > -75)&(X.pickup_longitude < -71)]
+    X = X[(X.pickup_latitude < 41.5)&(X.pickup_latitude > 40.2)]
+    X = X[(X.dropoff_longitude > -75)&(X.dropoff_longitude < -71)]
+    X = X[(X.dropoff_latitude < 41.5)&(X.dropoff_latitude > 40.2)]
+
+
+    y = np.log1p(y)
+    X = self._transform(X)
+    self.model.fit(X, y)
+
+  def predict(self, X):
+    X = self._transform(X)
+    y_pred = self.model.predict(X)
+    return np.expm1(y_pred)
+
+  def _get_zone(self, latitude, longitude):
+    left, right, down, up = -74.01711788940429, -73.94522857666014, 40.70341110229492, 40.80621337890625
+    longitude_lines = np.linspace(left, right, 5)
+    latitude_lines = np.linspace(down, up, 5)
+    zone = ""
+    for i in range(len(longitude_lines)-1):
+      if longitude > longitude_lines[i] and longitude < longitude_lines[i+1]:
+        zone+=str(i)
+        break
+
+    for i in range(len(latitude_lines)-1):
+      if latitude > latitude_lines[i] and latitude < latitude_lines[i+1]:
+        zone+=str(i)
+        break
+
+    if len(zone) < 2:
+      return "NotInBox"
+    return zone
+
+  def _passenger_count_clipper(self, x):
+    if x > 6:
+      return 6
+    elif x < 1:
+      return 1
+    return x
+
+
+  def _is_jam_analyze(self, x):
+    if x > 6 and x < 21:
+      return 1
+    return 0
